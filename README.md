@@ -1,4 +1,4 @@
-# AXI-Lite SPI Master for Accelerometer (EECE 423)
+# AXI-Lite SPI Master for Accelerometer
 
 This project is a complete system for interfacing a Xilinx Zynq (on a ZedBoard) with an ADXL345 accelerometer (on a PmodACL). It was developed for the EECE 423: Reconfigurable Computing course.
 
