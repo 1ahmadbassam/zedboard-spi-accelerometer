@@ -3,6 +3,7 @@
 #include "xil_printf.h"
 #include "xtmrctr.h"
 #include "spiaccelIP.h"
+#include "cordicIP.h"
 #include <xtmrctr_l.h>
 #include <math.h>
 
@@ -23,7 +24,39 @@
 // 500msec
 #define TIMER_RELOAD_VALUE          50000000
 
+// Cordic Unit
+#define CORDIC_BASE_ADDRESS         XPAR_CORDICIP_0_BASEADDR
+#define C_Y CORDICIP_S00_AXI_SLV_REG0_OFFSET
+#define C_Z CORDICIP_S00_AXI_SLV_REG1_OFFSET
+#define C_CTRL CORDICIP_S00_AXI_SLV_REG2_OFFSET
+#define C_STATUS CORDICIP_S00_AXI_SLV_REG3_OFFSET
+#define C_ANGLE CORDICIP_S00_AXI_SLV_REG4_OFFSET
+#define SCALE_FACTOR (1.0f / 4096.0f)
+
+float atan2_cordic(short y_accel, short z_accel) {
+    int ctrl;
+    short angle;
+
+    CORDICIP_mWriteReg(CORDIC_BASE_ADDRESS, C_Y, y_accel);
+    CORDICIP_mWriteReg(CORDIC_BASE_ADDRESS, C_Z, z_accel);
+
+    // start operation
+    ctrl = CORDICIP_mReadReg(CORDIC_BASE_ADDRESS, C_CTRL);
+    CORDICIP_mWriteReg(CORDIC_BASE_ADDRESS, C_CTRL, ctrl | 0x1);
+    CORDICIP_mWriteReg(CORDIC_BASE_ADDRESS, C_CTRL, ctrl & 0xFFFFFFFE);
+
+    // wait for operation to finish
+    while (!(CORDICIP_mReadReg(CORDIC_BASE_ADDRESS, C_STATUS) & 0x1));
+
+    angle = (short) (CORDICIP_mReadReg(CORDIC_BASE_ADDRESS, C_ANGLE) & 0x0000FFFF);
+    return (float)angle * SCALE_FACTOR;
+}
+
 XTmrCtr TMRInst; 
+static volatile int g_x;
+static volatile int g_y;
+static volatile int g_z;
+static volatile u8 g_flag;
 
 static int TimerInitFunction(XTmrCtr *InstancePtr, UINTPTR BaseAddress);
 static XStatus ADXL345InitFunction(void);
@@ -35,19 +68,14 @@ static XStatus ADXL345GetAcceleration(int *x, int *y, int *z);
 void TM_Intr_Handler(void *CallbackRef) {
     XTmrCtr *TMRInst_LOCAL = (XTmrCtr*) CallbackRef;
     XTmrCtrStats stats;
-    int x, y, z;
-
     XTmrCtr_DisableIntr(TIMER_BASE_ADDR, 0);
 
     // Read and clear the interrupt status in the AXI timer immediately
     XTmrCtr_GetStats(TMRInst_LOCAL, &stats);
     XTmrCtr_ClearStats(TMRInst_LOCAL);
     
-    // print yz plane inclination
-    if (ADXL345GetAcceleration(&x, &y, &z) == XST_SUCCESS) {
-        xil_printf("Y-Z Plane Inclination: %f degrees \r\n", 
-            atan2((double)y, (double)z) * (180.0 / M_PI));
-    }
+    g_flag = 1;
+    ADXL345GetAcceleration(&g_x, &g_y, &g_z);
 
     XTmrCtr_ClearStats(TMRInst_LOCAL);
 
@@ -88,6 +116,8 @@ static XStatus ADXL345InitFunction(void) {
 int main (void)
 {
     int status;
+    float sw_angle, hw_angle;
+    float error;
     
     xil_printf("--- Accelerometer ---\r\n");
     
@@ -113,7 +143,16 @@ int main (void)
     if(status != XST_SUCCESS) return XST_FAILURE;
 
     while(1) {
-        // do nothing, will be interrupted
+        while (!g_flag);
+        if (g_flag) {
+            g_flag = 0;
+            sw_angle = (float) atan2((double)g_y, (double)g_z);
+            hw_angle = atan2_cordic(g_y, g_z);
+            error = fabsf(sw_angle - hw_angle);
+            // multiplied by 1000 to see decimals in integer-only xil_printf
+            xil_printf("HW: %d mRad, SW: %d mRad, Err: %d mRad\r\n", 
+                            (int)(hw_angle*1000), (int)(sw_angle*1000), (int)(error*1000));
+        }
     }
 
     return 0;
