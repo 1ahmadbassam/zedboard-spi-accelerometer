@@ -1,41 +1,65 @@
-# AXI-Lite SPI Master for Accelerometer
+# Zynq Accelerometer System with Hardware CORDIC Calculation
 
-This project is a complete system for interfacing a Xilinx Zynq (on a ZedBoard) with an ADXL345 accelerometer (on a PmodACL). It was developed for the EECE 423: Reconfigurable Computing course.
+This project implements a complete system for interfacing a Xilinx Zynq (ZedBoard) with an ADXL345 accelerometer (PmodACL). Originally designed for **EECE 423**, the project has been expanded to move computational load from the processor to the Programmable Logic (PL).
 
-The core of the project is a custom AXI-Lite SPI master, created in Verilog, which is deployed to the Zynq's Programmable Logic (PL). This hardware block is then controlled by a C application running on the Processing System (PS), which reads the accelerometer data and calculates the board's inclination.
+The system features two custom AXI-Lite IP blocks:
+1.  **SPI Master IP:** Handles communication with the accelerometer.
+2.  **CORDIC Angle IP:** A hardware accelerator that computes the inclination angle using the CORDIC algorithm in fixed-point arithmetic, replacing the software `atan2` function.
 
 ## Project Components
 
-The project is split into two main parts: the Verilog hardware (PL) and the C software (PS).
+The design is partitioned between the Programmable Logic (Verilog) and the Processing System (C Application).
 
 ### Hardware (Verilog - PL)
 
-The hardware consists of a custom AXI-Lite IP block (`spiaccelIP`) that acts as an SPI master.
+#### 1. SPI Master IP (`spiaccelIP`)
+This block acts as the bridge between the Zynq and the ADXL345.
+* **`spi_master.v`**: The core FSM managing SPI transactions. Supports all 4 modes and multi-byte transfers.
+* **`spiaccelIP_slave...v`**: The AXI-Lite interface exposing Control, TX, and RX registers to the CPU.
+* **`constraints.xdc`**: Maps the SPI signals to the ZedBoard **JA1** Pmod connector.
 
-* **`spi_master.v`**: This is the core SPI master logic. It's a configurable FSM-based module that manages SPI transactions. It supports all 4 SPI modes, a configurable clock frequency (derived from the 100MHz AXI clock), and multi-byte transfers up to 16 bytes.
-* **`spiaccelIP_slave_lite_v1_0_S00_AXI.v`**: This is the AXI-Lite slave interface that connects to the Zynq's processing system. It provides three 32-bit registers for software control:
-    * **Register 0 (CSR):** Control/Status Register. Used to configure the SPI mode, clock scale, and reset the core. It also provides the `o_TX_Ready` status bit.
-    * **Register 1 (TX):** Transmit Register. Writing to this register triggers a new SPI transaction, sending the specified byte(s).
-    * **Register 2 (RX):** Receive Register. Polling this register allows the software to retrieve data received from the SPI slave.
-* **`spiaccelIP.v`**: The top-level wrapper that instantiates both the AXI slave interface and the `spi_master` logic, connecting them.
-* **`constraints.xdc`**: The Xilinx Design Constraints file. This is crucial as it maps the external SPI ports of the Verilog IP (`spi_clk`, `spi_mosi`, `spi_miso`, `spi_cs_n`) to the physical pins of the ZedBoard's **JA1** Pmod connector.
+#### 2. CORDIC Angle IP (`cordicIP`)
+A dedicated hardware unit that computes $\theta = atan2(Y, Z)$ using integer arithmetic.
+* **`cordic_angle.v`**: The DSP datapath. It implements a 13-iteration CORDIC algorithm (Vectoring Mode) using only shifts and adds.
+    * **Input:** 16-bit signed integers (Y, Z) from the accelerometer.
+    * **Output:** 16-bit **Q3.12 Fixed-Point** angle (1 sign bit, 3 integer bits, 12 fractional bits).
+    * **Logic:** Uses a lookup table for arctan constants to converge on the angle.
+* **`cordicIP_slave...v`**: The AXI-Lite interface mapping the CORDIC signals to a 5-register memory map:
+    * `0x00` (C_Y) & `0x04` (C_Z): Input registers.
+    * `0x08` (C_CTRL): Control register (Bit 0 = Start).
+    * `0x0C` (C_STATUS): Status register (Bit 0 = Done).
+    * `0x10` (C_ANGLE): Result output register.
 
 ### Software (C - PS)
 
-The software runs on the Zynq's ARM processor and controls the custom hardware.
+The application running on the ARM processor orchestrates the data flow between the two hardware IPs.
 
-* **`spiaccelIP.h` / `spiaccelIP.c`**: This is the low-level C driver for the custom IP. It abstracts the AXI-Lite register operations into a set of simple functions (e.g., `spi_configure`, `spi_write`, `spi_readaddr`).
-* **`accelerometer.c`**: This is the main application that demonstrates the complete system. Its logic is as follows:
-    1.  Initializes the AXI Timer to generate an interrupt every 500ms.
-    2.  Initializes the custom SPI IP using the driver, setting it to **SPI Mode 3** and a 4MHz clock (100MHz / 25).
-    3.  Initializes the ADXL345 accelerometer by writing to its `DATA_FORMAT` and `POWER_CTL` registers.
-    4.  Enters an infinite loop (acting as a background thread).
-    5.  The **Timer Interrupt Handler** (`TM_Intr_Handler`) executes every 500ms. Inside the handler:
-        * It reads the 6 data registers (X, Y, Z acceleration) from the ADXL345 using a multi-byte read.
-        * It calculates the board's Y-Z plane inclination in degrees using the `atan2` math function.
-        * It prints the calculated angle to the serial terminal (PuTTY).
+* **Drivers (`spiaccelIP.c` / `cordicIP.h`)**: Low-level drivers to handle AXI register read/writes.
+* **`accelerometer.c`**: The main application logic.
+    1.  **Initialization:** Configures the SPI core (Mode 3, 4MHz) and the ADXL345 (Data Format, Power Control).
+    2.  **Interrupt Loop:** A timer triggers an interrupt every 500ms.
+    3.  **Data Acquisition:** Reads raw X, Y, Z acceleration data via the **SPI IP**.
+    4.  **Hardware Computation:** Writes Y and Z to the **CORDIC IP**, asserts the "Start" bit, polls for "Done", and reads the resulting fixed-point angle.
+    5.  **Software Verification:** Computes the same angle using the C math library `atan2f`.
+    6.  **Reporting:** Prints the Hardware Angle, Software Angle, and the error margin to the serial terminal.
+
+## Fixed-Point Format & Accuracy
+
+The CORDIC IP outputs data in **Q3.12 format**. The conversion logic used in the software is:
+
+$$\theta_{radians} = \frac{\text{Hardware\_Output}}{2^{12}} = \frac{\text{Hardware\_Output}}{4096.0}$$
+
+* **Precision:** The hardware uses 13 iterations.
+* **Accuracy:** The hardware result typically matches the floating-point software result with an error margin of < 0.004 radians (< 0.2 degrees).
 
 ## Build and Run
 
-1.  **Hardware (Vivado):** The Verilog files (`.v`) are used to create a new AXI-Lite IP in Vivado. This IP is added to a block design along with a Zynq Processing System and an AXI Timer. The `constraints.xdc` file is added to the project, and a bitstream is generated.
-2.  **Software (Vitis/SDK):** The hardware platform (XSA) is exported from Vivado to Vitis. A new application is created, and the C files (`.c`, `.h`) are added. The application is built (linking the `m` library for `atan2`) and run on the ZedBoard.
+1.  **Hardware (Vivado):**
+    * Package both `spiaccelIP` and `cordicIP` as generic AXI peripherals.
+    * Create a Block Design connecting both IPs to the Zynq Processing System and an AXI Timer.
+    * Import `constraints.xdc` and generate the bitstream.
+2.  **Software (Vitis/SDK):**
+    * Export the XSA hardware platform.
+    * Import the C sources (`accelerometer.c`, drivers).
+    * Ensure the linker includes the math library (`-lm`) for the software comparison.
+    * Run on ZedBoard and view output via Serial Terminal (115200 baud).
